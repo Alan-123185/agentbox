@@ -4,6 +4,9 @@ package windows
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"unsafe"
 
 	"github.com/zhangyunhao116/agentbox/platform"
@@ -395,6 +398,119 @@ func cleanupACLs(applied []aclEntry, sid *windows.SID) error {
 
 	if len(errs) > 0 {
 		return fmt.Errorf("ACL cleanup failed for %d/%d paths: %v", len(errs), len(applied), errs)
+	}
+
+	return nil
+}
+
+// validateSandboxACLPaths validates that ACL paths are safe for sandbox use.
+// SAFE MVP: This function ensures we never modify ACLs for dangerous paths
+// that could affect the current user's home directory or system directories.
+//
+// It rejects:
+//   - C:\Users\<current-user> and subdirectories (Desktop, Documents, Downloads, etc.)
+//   - C:\Windows
+//   - C:\Program Files
+//   - C:\Program Files (x86)
+//   - C:\ProgramData
+//
+// Returns an error if any path is unsafe.
+func validateSandboxACLPaths(cfg *platform.WrapConfig, currentUserSID *windows.SID) error {
+	if currentUserSID == nil {
+		// Cannot validate without current user SID
+		return nil
+	}
+
+	currentUserProfile := os.Getenv("USERPROFILE")
+	if currentUserProfile == "" {
+		// Try to construct from HOMEDRIVE + HOMEPATH
+		homeDrive := os.Getenv("HOMEDRIVE")
+		homePath := os.Getenv("HOMEPATH")
+		if homeDrive != "" && homePath != "" {
+			currentUserProfile = filepath.Join(homeDrive, homePath)
+		}
+	}
+
+	// Normalize current user profile path
+	currentUserProfile = normalizeWindowsPath(currentUserProfile)
+
+	// Build list of protected paths
+	protectedPaths := []string{
+		currentUserProfile,
+		filepath.Join(currentUserProfile, "Desktop"),
+		filepath.Join(currentUserProfile, "Documents"),
+		filepath.Join(currentUserProfile, "Downloads"),
+		filepath.Join(currentUserProfile, "Pictures"),
+		filepath.Join(currentUserProfile, "Music"),
+		filepath.Join(currentUserProfile, "Videos"),
+	}
+
+	// Add system directories
+	windir := os.Getenv("SYSTEMROOT")
+	if windir == "" {
+		windir = `C:\Windows`
+	}
+	protectedPaths = append(protectedPaths, normalizeWindowsPath(windir))
+
+	progFiles := os.Getenv("PROGRAMFILES")
+	if progFiles == "" {
+		progFiles = `C:\Program Files`
+	}
+	protectedPaths = append(protectedPaths, normalizeWindowsPath(progFiles))
+
+	progFilesX86 := os.Getenv("PROGRAMFILES(X86)")
+	if progFilesX86 == "" {
+		progFilesX86 = `C:\Program Files (x86)`
+	}
+	protectedPaths = append(protectedPaths, normalizeWindowsPath(progFilesX86))
+
+	progData := os.Getenv("PROGRAMDATA")
+	if progData == "" {
+		progData = `C:\ProgramData`
+	}
+	protectedPaths = append(protectedPaths, normalizeWindowsPath(progData))
+
+	// Check WritableRoots
+	for _, path := range cfg.WritableRoots {
+		if err := checkPathNotProtected(path, protectedPaths, currentUserProfile); err != nil {
+			return err
+		}
+	}
+
+	// Check DenyWrite
+	for _, path := range cfg.DenyWrite {
+		if err := checkPathNotProtected(path, protectedPaths, currentUserProfile); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// normalizeWindowsPath normalizes a Windows path for comparison.
+// It converts to absolute path, cleans it, and lowercases for case-insensitive comparison.
+func normalizeWindowsPath(path string) string {
+	// Convert to absolute path
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return strings.ToLower(filepath.Clean(path))
+	}
+	return strings.ToLower(filepath.Clean(absPath))
+}
+
+// checkPathNotProtected checks if a path is under any protected path.
+// Returns an error if the path is protected.
+func checkPathNotProtected(path string, protectedPaths []string, currentUserProfile string) error {
+	normalizedPath := normalizeWindowsPath(path)
+
+	for _, protected := range protectedPaths {
+		if protected == "" {
+			continue
+		}
+		// Check if path equals or is under protected path
+		if normalizedPath == protected || strings.HasPrefix(normalizedPath, protected+"\\") {
+			return fmt.Errorf("path %q is protected and cannot be used for sandbox ACL", path)
+		}
 	}
 
 	return nil

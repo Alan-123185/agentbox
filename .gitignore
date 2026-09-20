@@ -1,64 +1,74 @@
-# Compiled binary (only the root-level CLI binary, not cmd/agentbox/ source dir)
-/agentbox
-
-# Test binary
-*.test
-
-# Example binaries
-/agentsim
-/approval
-/benchmark
-/classifier
-/codemod
-/codereview
-/darwin
-/devworkflow
-/envutil
-/filesystem
-/gitops
-/healthcheck
-/manager
-/minimal
-/multicommand
-/network
-/networkaccess
-/pathutil
-/projectinit
-/projectscaffold
-/researchflow
-/ruleanalysis
-/sandbox-bench
-/security
-/timeout
-/trustlevel9
-/wrap
-
-# Windows executables
-*.exe
-
-# Coverage output
-*.out
-coverage.html
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
+```
 # Build artifacts
-/bin/
-/dist/
+*.exe
+*.dll
+*.so
+*.a
+*.obj
+*.out
 
-# Benchmark reports (generated on test servers)
-/benchmarks/
+# Dependencies
+vendor/
 
-# Misc
-/EOF
-all_commands_merged.json
-all_execute_commands.json
-execute_commands_all_raw.json
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Distribution
+dist/
+build/
+target/
+
+# Python specific
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.Python
+*.egg-info/
+.eggs/
+.installed.cfg
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git/
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+
+# Go specific
+*.a
+_testmain.go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.prof
+.DS_Store
+```

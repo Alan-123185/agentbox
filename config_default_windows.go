@@ -10,6 +10,10 @@ import (
 // defaultDenyWritePaths returns the default list of paths to deny write access to
 // on Windows systems. These are core system directories that should not be modified
 // by sandboxed processes.
+//
+// SAFE MVP: This function no longer includes the user's home directory.
+// The sandbox uses a dedicated sandbox user account for isolation, so there's
+// no need to add DENY ACEs against the current user's SID.
 func defaultDenyWritePaths(home string) []string {
 	// Protect Windows system directories from sandbox writes.
 	windir := os.Getenv("SYSTEMROOT") // typically C:\Windows
@@ -32,8 +36,11 @@ func defaultDenyWritePaths(home string) []string {
 		progData = `C:\ProgramData`
 	}
 
+	// SAFE MVP: Do NOT include home directory in DenyWrite.
+	// The sandbox user account provides isolation - it cannot access the current
+	// user's files by default. Adding DENY ACEs against the current user's SID
+	// would risk corrupting host permissions if cleanup fails.
 	return []string{
-		home,
 		windir,
 		progFiles,
 		progFilesX86,
