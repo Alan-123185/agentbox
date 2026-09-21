@@ -1,74 +1,63 @@
 ```
+# Dependencies
+go.mod
+go.sum
+
 # Build artifacts
+*.o
+*.a
+*.so
 *.exe
 *.dll
-*.so
-*.a
+*.dylib
+*.pyc
+*.class
 *.obj
 *.out
 
-# Dependencies
-vendor/
+# Distribution / packaging
+bin/
+pkg/
 
-# Logs and temp files
-*.log
-*.tmp
-
-# Environment
+# Environment specific
 .env
 .env.local
-*.env.*
+.env.*
+!.env.example
 
-# Editors
+# IDE / Editor
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
-# Coverage
+# Logs
+*.log
+
+# Test coverage
 coverage/
 htmlcov/
 .coverage
+*.coverprofile
 
-# Distribution
-dist/
-build/
-target/
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
 
-# Python specific
+# Cache directories
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.so
-.Python
-*.egg-info/
-.eggs/
-.installed.cfg
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.git/
-.mypy_cache/
 .pytest_cache/
-.hypothesis/
-
-# Go specific
-*.a
-_testmain.go
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.test
-*.prof
-.DS_Store
+.mypy_cache/
+.npm
+.yarn/cache
+node_modules/
+vendor/
+target/
+build/
+dist/
 ```

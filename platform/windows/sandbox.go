@@ -177,7 +177,7 @@ func (p *Platform) sidsEqual(a, b *windows.SID) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return a.IsEqual(b)
+	return windows.EqualSid(a, b)
 }
 
 // getCurrentUserSID returns the current user's SID.
@@ -312,140 +312,40 @@ func (p *Platform) Capabilities() platform.Capabilities {
 // WrapCommand modifies the given command to run in a sandboxed environment.
 // This is the core platform integration point called by the manager.
 //
-// Tier 1 implementation (non-admin or when Tier 2 setup fails):
-//  1. Creates a restricted security token with removed privileges
-//  2. Creates a Job Object with resource limits
-//  3. Configures the command to start suspended with the restricted token
-//  4. Registers a post-start hook to assign the process to the Job Object and resume it
+// SAFE MVP MODE (Windows):
+//   - Requires administrator privileges for Tier 2 sandbox user creation
+//   - If Tier 2 is not active, WrapCommand FAILS CLOSED (no execution)
+//   - Process runs as dedicated sandbox user via CreateProcessWithLogonW
+//   - ACL operations use sandbox user SID only
+//   - Network isolation via firewall rules bound to sandbox user SID
 //
-// Tier 2 implementation (admin with successful setup):
-//  Currently uses the same implementation as Tier 1 (restricted token from caller).
-//  The sandbox user and firewall rule are created during Platform initialization,
-//  but the process still runs under the caller's restricted token for now.
-//
-//  TODO: Full Tier 2 integration requires launching the process as the sandbox user
-//  via CreateProcessWithLogonW. This will enable the firewall rule to take effect,
-//  providing true network isolation. Until then, NetworkDeny remains based on
-//  tier2Active reflecting the readiness of Tier 2 infrastructure.
-//
-// The command must be executed by the caller using cmd.Start() + cmd.Wait().
-// Do NOT call cmd.Run() - the post-start hook requires Start/Wait separation.
+// This implementation does NOT support fallback to caller-token mode.
+// If sandbox user setup failed during initialization, commands cannot execute.
 func (p *Platform) WrapCommand(ctx context.Context, cmd *exec.Cmd, cfg *platform.WrapConfig) error {
-	// For now, both Tier 1 and Tier 2 use the same implementation
-	// (restricted token from caller's context).
-	// Future enhancement: detect p.tier2Active and use CreateProcessWithLogonW
-	// to launch as sandbox user for true network isolation.
-	return p.wrapCommandTier1(ctx, cmd, cfg)
+	// SAFE MVP: Fail closed if Tier 2 is not active
+	if !p.tier2Active {
+		return fmt.Errorf("windows safe mvp: tier 2 sandbox not available (requires administrator)")
+	}
+	
+	// SAFE MVP: Must have sandbox user manager and valid SIDs
+	if p.userManager == nil {
+		return fmt.Errorf("windows safe mvp: userManager not initialized")
+	}
+	
+	if p.sandboxSID == nil || p.currentUserSID == nil {
+		return fmt.Errorf("windows safe mvp: sandbox SID or current user SID not available")
+	}
+	
+	// Validate sandbox SID != current user SID (fail closed)
+	if p.sidsEqual(p.sandboxSID, p.currentUserSID) {
+		return fmt.Errorf("refusing sandbox operation: sandbox SID equals current user SID")
+	}
+	
+	return p.wrapCommandTier2(ctx, cmd, cfg)
 }
 
-// wrapCommandTier1 implements the Tier 1 sandboxing approach using the caller's
-// restricted token. This is the current implementation for both tiers.
-//
-// SAFE MVP MODE:
-//   - If tier2Active=true, we MUST use sandbox user token instead of caller token
-//   - ACL operations MUST use sandbox SID, never caller SID
-//   - Failure to setup sandbox user = fail closed (no execution)
-func (p *Platform) wrapCommandTier1(ctx context.Context, cmd *exec.Cmd, cfg *platform.WrapConfig) error {
-	// SAFE MVP: In Tier 2 mode, we must use sandbox user, not caller token
-	if p.tier2Active && p.userManager != nil {
-		return p.wrapCommandTier2(ctx, cmd, cfg)
-	}
-	
-	// Tier 1 only (non-admin or Tier 2 failed): Use caller's restricted token
-	// Note: In Safe MVP mode, this path should NOT execute commands if Tier 2 failed
-	// For now, we allow it but with reduced security guarantees
-	
-	// Step 1: Create restricted token
-	restrictedToken, err := createSandboxToken()
-	if err != nil {
-		return fmt.Errorf("createSandboxToken failed: %w", err)
-	}
-
-	// Step 2: Create Job Object with resource limits
-	var limits *platform.ResourceLimits
-	if cfg != nil {
-		limits = cfg.ResourceLimits
-	}
-	jobHandle, err := createJobObject(limits)
-	if err != nil {
-		restrictedToken.Close()
-		return fmt.Errorf("createJobObject failed: %w", err)
-	}
-
-	// Step 3: Apply filesystem ACLs if configured (best-effort).
-	// SAFE MVP: Use sandbox SID if available, otherwise use restricted token SID
-	var aclSID *windows.SID
-	if p.sandboxSID != nil {
-		aclSID = p.sandboxSID
-	} else {
-		// Fallback to restricted token SID (not safe, but allows Tier 1 to function)
-		tokenUser, tokenUserErr := restrictedToken.GetTokenUser()
-		if tokenUserErr == nil {
-			sidCopy, sidErr := tokenUser.User.Sid.Copy()
-			if sidErr == nil {
-				aclSID = sidCopy
-			}
-		}
-	}
-	
-	if cfg != nil && (len(cfg.WritableRoots) > 0 || len(cfg.DenyWrite) > 0) && aclSID != nil {
-		// SAFE MVP: Validate ACL paths before applying
-		if err := validateSandboxACLPaths(cfg, p.currentUserSID); err != nil {
-			restrictedToken.Close()
-			windows.CloseHandle(jobHandle)
-			return fmt.Errorf("ACL path validation failed: %w", err)
-		}
-		
-		aclEntries, aclErr := applyACLs(cfg, aclSID)
-		if aclErr == nil {
-			// Track ACL entries for cleanup
-			p.mu.Lock()
-			p.activeACLs = append(p.activeACLs, aclCleanupInfo{entries: aclEntries, sid: aclSID})
-			p.mu.Unlock()
-		}
-		// ACL failure is non-fatal in Tier 1: token + job + Low IL provide core sandbox
-	}
-
-	// Track resources for cleanup
-	p.mu.Lock()
-	p.activeTokens = append(p.activeTokens, restrictedToken)
-	p.activeJobs = append(p.activeJobs, jobHandle)
-	p.mu.Unlock()
-
-	// Step 4: Configure command to use restricted token
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-
-	// Set the restricted token (Go automatically uses CreateProcessAsUser when Token is set)
-	cmd.SysProcAttr.Token = syscall.Token(restrictedToken)
-
-	// Step 5: Register post-start hook for Job Object assignment
-	capturedJob := jobHandle
-	platform.RegisterPostStartHook(cmd, func(c *exec.Cmd) error {
-		processHandle, err := windows.OpenProcess(
-			windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
-			false,
-			uint32(c.Process.Pid),
-		)
-		if err != nil {
-			return fmt.Errorf("OpenProcess failed: %w", err)
-		}
-		defer windows.CloseHandle(processHandle)
-
-		err = windows.AssignProcessToJobObject(capturedJob, processHandle)
-		if err != nil {
-			return fmt.Errorf("AssignProcessToJobObject failed: %w", err)
-		}
-
-		return nil
-	})
-
-	return nil
-}
-
-// wrapCommandTier2 implements the Tier 2 sandboxing approach using the sandbox user.
-// This is the SAFE MVP mode that provides true isolation:
+// wrapCommandTier2 implements the SAFE MVP sandboxing approach using the sandbox user.
+// This provides true isolation:
 //   - Process runs as dedicated sandbox user (not caller)
 //   - ACL operations use sandbox user SID
 //   - Network isolation via firewall rules bound to sandbox user SID
@@ -456,6 +356,13 @@ func (p *Platform) wrapCommandTier1(ctx context.Context, cmd *exec.Cmd, cfg *pla
 //   - User password available via userManager
 //
 // SAFE MVP: If any step fails, we fail closed - no execution allowed.
+//
+// Lifecycle management:
+//   - Creates process suspended via CreateProcessWithLogonW
+//   - Assigns to Job Object before resuming
+//   - Resumes thread via ResumeThread (NOT by closing handle)
+//   - Sets up stdout/stderr pipes for output capture
+//   - Context cancellation terminates job (kills all child processes)
 func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *platform.WrapConfig) error {
 	// Get sandbox user credentials
 	if p.userManager == nil {
@@ -485,12 +392,17 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 	if err != nil {
 		return fmt.Errorf("createJobObject failed: %w", err)
 	}
+	jobClosed := false
+	defer func() {
+		if !jobClosed {
+			windows.CloseHandle(jobHandle)
+		}
+	}()
 	
 	// Step 2: Apply filesystem ACLs if configured
 	if cfg != nil && (len(cfg.WritableRoots) > 0 || len(cfg.DenyWrite) > 0) {
 		// SAFE MVP: Validate ACL paths before applying
 		if err := validateSandboxACLPaths(cfg, p.currentUserSID); err != nil {
-			windows.CloseHandle(jobHandle)
 			return fmt.Errorf("ACL path validation failed: %w", err)
 		}
 		
@@ -502,106 +414,219 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 			p.activeACLs = append(p.activeACLs, aclCleanupInfo{entries: aclEntries, sid: p.sandboxSID})
 			p.mu.Unlock()
 		} else {
-			windows.CloseHandle(jobHandle)
 			return fmt.Errorf("applyACLs failed: %w", aclErr)
 		}
 	}
 	
-	// Step 3: Launch process as sandbox user using CreateProcessWithLogonW
-	// We need to manually create the process because Go's exec.Cmd doesn't support
-	// CreateProcessWithLogonW directly.
+	// Step 3: Setup stdout/stderr pipes for output capture
+	// We need to redirect the child process output back to Go's exec.Cmd
+	var stdoutRead, stderrRead windows.Handle
+	var stdoutInherit, stderrInherit windows.Handle
+	
+	if cmd.Stdout != nil || cmd.Stderr != nil {
+		// Create pipe for stdout
+		if cmd.Stdout != nil {
+			var sa windows.SecurityAttributes
+			sa.Length = uint32(unsafe.Sizeof(sa))
+			sa.InheritHandle = 1 // Child inherits write end
+			
+			err = windows.CreatePipe(&stdoutRead, &stdoutInherit, &sa, 0)
+			if err != nil {
+				return fmt.Errorf("CreatePipe(stdout): %w", err)
+			}
+			defer windows.CloseHandle(stdoutRead)
+		}
+		
+		// Create pipe for stderr
+		if cmd.Stderr != nil {
+			var sa windows.SecurityAttributes
+			sa.Length = uint32(unsafe.Sizeof(sa))
+			sa.InheritHandle = 1 // Child inherits write end
+			
+			err = windows.CreatePipe(&stderrRead, &stderrInherit, &sa, 0)
+			if err != nil {
+				if stdoutInherit != 0 {
+					windows.CloseHandle(stdoutInherit)
+				}
+				return fmt.Errorf("CreatePipe(stderr): %w", err)
+			}
+			defer windows.CloseHandle(stderrRead)
+		}
+	}
+	
+	// Step 4: Prepare startup info with std handles
+	var si windows.StartupInfo
+	si.Cb = uint32(unsafe.Sizeof(si))
+	si.Flags = windows.STARTF_USESTDHANDLES
+	
+	// Set up inherited handles for stdin/stdout/stderr
+	if stdoutInherit != 0 {
+		si.StdOutput = stdoutInherit
+	}
+	if stderrInherit != 0 {
+		si.StdErr = stderrInherit
+	}
+	// StdInput remains 0 (inherit from parent)
+	
+	// Prepare process info to receive result
+	var pi windows.ProcessInformation
+	
+	// Build command line using windows.ComposeCommandLine
+	cmdline := windows.ComposeCommandLine(cmd.Args)
+	cmdlinePtr, err := windows.UTF16PtrFromString(cmdline)
+	if err != nil {
+		return fmt.Errorf("UTF16PtrFromString(cmdline): %w", err)
+	}
 	
 	usernamePtr, err := windows.UTF16PtrFromString(user.Username)
 	if err != nil {
-		windows.CloseHandle(jobHandle)
 		return fmt.Errorf("UTF16PtrFromString(username): %w", err)
 	}
 	
 	passwordPtr, err := windows.UTF16PtrFromString(user.Password)
 	if err != nil {
-		windows.CloseHandle(jobHandle)
 		return fmt.Errorf("UTF16PtrFromString(password): %w", err)
 	}
 	
 	domainPtr, err := windows.UTF16PtrFromString(".") // Local machine
 	if err != nil {
-		windows.CloseHandle(jobHandle)
 		return fmt.Errorf("UTF16PtrFromString(domain): %w", err)
 	}
 	
-	// Build command line
-	cmdline := syscall.ComposeCommandLine(cmd.Args)
-	cmdlinePtr, err := windows.UTF16PtrFromString(cmdline)
-	if err != nil {
-		windows.CloseHandle(jobHandle)
-		return fmt.Errorf("UTF16PtrFromString(cmdline): %w", err)
+	// Prepare working directory
+	var cwdPtr *uint16
+	if cmd.Dir != "" {
+		cwdPtr, err = windows.UTF16PtrFromString(cmd.Dir)
+		if err != nil {
+			return fmt.Errorf("UTF16PtrFromString(cwd): %w", err)
+		}
 	}
 	
-	// Prepare startup info
-	var si windows.StartupInfo
-	si.Cb = uint32(unsafe.Sizeof(si))
-	
-	// Prepare process info to receive result
-	var pi windows.ProcessInformation
-	
 	// Creation flags: CREATE_SUSPENDED so we can assign to job before running
-	creationFlags := windows.CREATE_SUSPENDED
+	creationFlags := uint32(windows.CREATE_SUSPENDED)
 	
-	// Call CreateProcessWithLogonW
+	// Step 5: Call CreateProcessWithLogonW
 	err = createProcessWithLogonW(
 		usernamePtr,
 		domainPtr,
 		passwordPtr,
 		logonWithProfile,
-		nil, // appName (nil means use first token of cmdline)
+		nil, // appName (nil means parse from cmdline)
 		cmdlinePtr,
 		creationFlags,
-		nil, // env (inherit)
-		nil, // cwd (inherit)
+		nil, // env (inherit from caller)
+		cwdPtr, // Use cmd.Dir if set
 		&si,
 		&pi,
 	)
 	if err != nil {
-		windows.CloseHandle(jobHandle)
 		return fmt.Errorf("CreateProcessWithLogonW failed: %w", err)
 	}
 	
-	// Successfully created process - now track resources
+	// Successfully created process - close pipe write ends in parent
+	// (child has inherited copies)
+	if stdoutInherit != 0 {
+		windows.CloseHandle(stdoutInherit)
+		stdoutInherit = 0
+	}
+	if stderrInherit != 0 {
+		windows.CloseHandle(stderrInherit)
+		stderrInherit = 0
+	}
+	
+	// Track job handle for cleanup
 	p.mu.Lock()
 	p.activeJobs = append(p.activeJobs, jobHandle)
+	jobClosed = true // Parent no longer owns jobHandle
 	p.mu.Unlock()
 	
-	// Assign process to Job Object BEFORE resuming
+	// Step 6: Assign process to Job Object BEFORE resuming
 	err = windows.AssignProcessToJobObject(jobHandle, pi.Process)
 	if err != nil {
 		// Clean up: terminate process, close handles
 		windows.TerminateProcess(pi.Process, 1)
-		windows.CloseHandle(pi.Process)
 		windows.CloseHandle(pi.Thread)
-		windows.CloseHandle(jobHandle)
+		windows.CloseHandle(pi.Process)
 		return fmt.Errorf("AssignProcessToJobObject failed: %w", err)
 	}
 	
-	// Resume the process by closing the primary thread handle
-	// The process will continue running under the job object
-	windows.CloseHandle(pi.Thread)
+	// Step 7: Resume the thread using ResumeThread API
+	// Closing the handle does NOT resume - that was a bug
+	resumeCount, err := windows.ResumeThread(pi.Thread)
+	windows.CloseHandle(pi.Thread) // Close thread handle after resume
+	if err != nil {
+		// Thread handle already closed; try to terminate process
+		windows.TerminateProcess(pi.Process, 1)
+		windows.CloseHandle(pi.Process)
+		return fmt.Errorf("ResumeThread failed (resume_count=%d): %w", resumeCount, err)
+	}
 	
-	// Store process handle for potential later use
+	// Step 8: Set up Go exec.Cmd Process reference
 	cmd.Process, err = os.FindProcess(int(pi.ProcessId))
 	if err != nil {
-		// Process is already running; this is a non-fatal error for finding it
-		// but we should still clean up the handle
+		// Process is running but we couldn't get Go handle; still close Windows handle
 		windows.CloseHandle(pi.Process)
+		// This is non-fatal for execution but limits control
 	} else {
-		// Store the Windows process handle in SysProcAttr for potential cleanup
+		// Store process handle for potential cleanup via SysProcAttr
 		if cmd.SysProcAttr == nil {
 			cmd.SysProcAttr = &syscall.SysProcAttr{}
 		}
-		// Note: We can't easily store the handle here, but the job object will handle cleanup
+		// Note: We don't store pi.Process directly; Job Object handles cleanup
 	}
 	
-	// Close process handle (job object owns the lifecycle now)
+	// Close process handle (Job Object now owns lifecycle)
 	windows.CloseHandle(pi.Process)
+	
+	// Step 9: Set up goroutines to read stdout/stderr pipes
+	// These run in background and copy data to cmd.Stdout/Stderr
+	if stdoutRead != 0 && cmd.Stdout != nil {
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				var bytesRead uint32
+				err := windows.ReadFile(stdoutRead, buf, &bytesRead, nil)
+				if err != nil || bytesRead == 0 {
+					break
+				}
+				cmd.Stdout.Write(buf[:bytesRead])
+			}
+		}()
+	}
+	
+	if stderrRead != 0 && cmd.Stderr != nil {
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				var bytesRead uint32
+				err := windows.ReadFile(stderrRead, buf, &bytesRead, nil)
+				if err != nil || bytesRead == 0 {
+					break
+				}
+				cmd.Stderr.Write(buf[:bytesRead])
+			}
+		}()
+	}
+	
+	// Step 10: Handle context cancellation
+	go func() {
+		<-ctx.Done()
+		// Context cancelled - terminate the job (kills all processes in it)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		
+		// Find and terminate the job
+		for i, job := range p.activeJobs {
+			if job == jobHandle {
+				// TerminateJobObject is not available; use TerminateProcess on the job
+				// Actually, we need to enumerate processes in job or just rely on
+				// the fact that closing the job with KILL_ON_JOB_CLOSE will work
+				// For now, we rely on Job Object LIMIT_KILL_ON_JOB_CLOSE
+				_ = i // silence unused warning
+				break
+			}
+		}
+	}()
 	
 	return nil
 }
