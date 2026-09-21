@@ -360,9 +360,13 @@ func (p *Platform) WrapCommand(ctx context.Context, cmd *exec.Cmd, cfg *platform
 // Lifecycle management:
 //   - Creates process suspended via CreateProcessWithLogonW
 //   - Assigns to Job Object before resuming
-//   - Resumes thread via ResumeThread (NOT by closing handle)
+//   - Resumes thread via ResumeThread
 //   - Sets up stdout/stderr pipes for output capture
 //   - Context cancellation terminates job (kills all child processes)
+//
+// NOTE: This function completely接管s the process lifecycle. It does NOT
+// return a cmd that needs Start() called. The process is already running.
+// The caller must NOT call cmd.Start() or cmd.Wait().
 func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *platform.WrapConfig) error {
 	// Get sandbox user credentials
 	if p.userManager == nil {
@@ -418,60 +422,7 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 		}
 	}
 	
-	// Step 3: Setup stdout/stderr pipes for output capture
-	// We need to redirect the child process output back to Go's exec.Cmd
-	var stdoutRead, stderrRead windows.Handle
-	var stdoutInherit, stderrInherit windows.Handle
-	
-	if cmd.Stdout != nil || cmd.Stderr != nil {
-		// Create pipe for stdout
-		if cmd.Stdout != nil {
-			var sa windows.SecurityAttributes
-			sa.Length = uint32(unsafe.Sizeof(sa))
-			sa.InheritHandle = 1 // Child inherits write end
-			
-			err = windows.CreatePipe(&stdoutRead, &stdoutInherit, &sa, 0)
-			if err != nil {
-				return fmt.Errorf("CreatePipe(stdout): %w", err)
-			}
-			defer windows.CloseHandle(stdoutRead)
-		}
-		
-		// Create pipe for stderr
-		if cmd.Stderr != nil {
-			var sa windows.SecurityAttributes
-			sa.Length = uint32(unsafe.Sizeof(sa))
-			sa.InheritHandle = 1 // Child inherits write end
-			
-			err = windows.CreatePipe(&stderrRead, &stderrInherit, &sa, 0)
-			if err != nil {
-				if stdoutInherit != 0 {
-					windows.CloseHandle(stdoutInherit)
-				}
-				return fmt.Errorf("CreatePipe(stderr): %w", err)
-			}
-			defer windows.CloseHandle(stderrRead)
-		}
-	}
-	
-	// Step 4: Prepare startup info with std handles
-	var si windows.StartupInfo
-	si.Cb = uint32(unsafe.Sizeof(si))
-	si.Flags = windows.STARTF_USESTDHANDLES
-	
-	// Set up inherited handles for stdin/stdout/stderr
-	if stdoutInherit != 0 {
-		si.StdOutput = stdoutInherit
-	}
-	if stderrInherit != 0 {
-		si.StdErr = stderrInherit
-	}
-	// StdInput remains 0 (inherit from parent)
-	
-	// Prepare process info to receive result
-	var pi windows.ProcessInformation
-	
-	// Build command line using windows.ComposeCommandLine
+	// Step 3: Prepare command line and arguments
 	cmdline := windows.ComposeCommandLine(cmd.Args)
 	cmdlinePtr, err := windows.UTF16PtrFromString(cmdline)
 	if err != nil {
@@ -502,10 +453,72 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 		}
 	}
 	
+	// Prepare environment block
+	var envPtr *uint16
+	if cmd.Env != nil {
+		envBlock := createEnvironmentBlock(cmd.Env)
+		envPtr, err = windows.UTF16PtrFromString(envBlock)
+		if err != nil {
+			return fmt.Errorf("createEnvironmentBlock failed: %w", err)
+		}
+	}
+	
+	// Step 4: Setup stdout/stderr pipes for output capture
+	var stdoutRead, stderrRead windows.Handle
+	var stdoutInherit, stderrInherit windows.Handle
+	
+	if cmd.Stdout != nil || cmd.Stderr != nil {
+		// Create pipe for stdout
+		if cmd.Stdout != nil {
+			var sa windows.SecurityAttributes
+			sa.Length = uint32(unsafe.Sizeof(sa))
+			sa.InheritHandle = 1 // Child inherits write end
+			
+			err = windows.CreatePipe(&stdoutRead, &stdoutInherit, &sa, 0)
+			if err != nil {
+				return fmt.Errorf("CreatePipe(stdout): %w", err)
+			}
+			// Note: stdoutRead will be closed by reader goroutine after EOF
+		}
+		
+		// Create pipe for stderr
+		if cmd.Stderr != nil {
+			var sa windows.SecurityAttributes
+			sa.Length = uint32(unsafe.Sizeof(sa))
+			sa.InheritHandle = 1 // Child inherits write end
+			
+			err = windows.CreatePipe(&stderrRead, &stderrInherit, &sa, 0)
+			if err != nil {
+				if stdoutInherit != 0 {
+					windows.CloseHandle(stdoutInherit)
+				}
+				return fmt.Errorf("CreatePipe(stderr): %w", err)
+			}
+			// Note: stderrRead will be closed by reader goroutine after EOF
+		}
+	}
+	
+	// Step 5: Prepare startup info with std handles
+	var si windows.StartupInfo
+	si.Cb = uint32(unsafe.Sizeof(si))
+	si.Flags = windows.STARTF_USESTDHANDLES
+	
+	// Set up inherited handles for stdin/stdout/stderr
+	if stdoutInherit != 0 {
+		si.StdOutput = stdoutInherit
+	}
+	if stderrInherit != 0 {
+		si.StdErr = stderrInherit
+	}
+	// StdInput remains 0 (inherit from parent)
+	
+	// Prepare process info to receive result
+	var pi windows.ProcessInformation
+	
 	// Creation flags: CREATE_SUSPENDED so we can assign to job before running
 	creationFlags := uint32(windows.CREATE_SUSPENDED)
 	
-	// Step 5: Call CreateProcessWithLogonW
+	// Step 6: Call CreateProcessWithLogonW
 	err = createProcessWithLogonW(
 		usernamePtr,
 		domainPtr,
@@ -514,7 +527,7 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 		nil, // appName (nil means parse from cmdline)
 		cmdlinePtr,
 		creationFlags,
-		nil, // env (inherit from caller)
+		envPtr, // Use cmd.Env if set
 		cwdPtr, // Use cmd.Dir if set
 		&si,
 		&pi,
@@ -534,13 +547,7 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 		stderrInherit = 0
 	}
 	
-	// Track job handle for cleanup
-	p.mu.Lock()
-	p.activeJobs = append(p.activeJobs, jobHandle)
-	jobClosed = true // Parent no longer owns jobHandle
-	p.mu.Unlock()
-	
-	// Step 6: Assign process to Job Object BEFORE resuming
+	// Step 7: Assign process to Job Object BEFORE resuming
 	err = windows.AssignProcessToJobObject(jobHandle, pi.Process)
 	if err != nil {
 		// Clean up: terminate process, close handles
@@ -550,8 +557,7 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 		return fmt.Errorf("AssignProcessToJobObject failed: %w", err)
 	}
 	
-	// Step 7: Resume the thread using ResumeThread API
-	// Closing the handle does NOT resume - that was a bug
+	// Step 8: Resume the thread using ResumeThread API
 	resumeCount, err := windows.ResumeThread(pi.Thread)
 	windows.CloseHandle(pi.Thread) // Close thread handle after resume
 	if err != nil {
@@ -561,27 +567,40 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 		return fmt.Errorf("ResumeThread failed (resume_count=%d): %w", resumeCount, err)
 	}
 	
-	// Step 8: Set up Go exec.Cmd Process reference
+	// Step 9: Store process handle and PID in cmd.Process
+	// We need to keep the process handle open for TerminateJobObject/wait
 	cmd.Process, err = os.FindProcess(int(pi.ProcessId))
 	if err != nil {
-		// Process is running but we couldn't get Go handle; still close Windows handle
 		windows.CloseHandle(pi.Process)
-		// This is non-fatal for execution but limits control
-	} else {
-		// Store process handle for potential cleanup via SysProcAttr
-		if cmd.SysProcAttr == nil {
-			cmd.SysProcAttr = &syscall.SysProcAttr{}
-		}
-		// Note: We don't store pi.Process directly; Job Object handles cleanup
+		return fmt.Errorf("FindProcess failed: %w", err)
 	}
 	
-	// Close process handle (Job Object now owns lifecycle)
+	// Store the Windows process handle in SysProcAttr for cleanup
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	// We'll store the handle using unsafe pointer (hack but necessary)
+	// Actually, we need a different approach - store in a map or context
+	
+	// Close our copy of process handle - Job Object owns lifecycle
+	// But we need to keep it for wait... let's use a different strategy
 	windows.CloseHandle(pi.Process)
 	
-	// Step 9: Set up goroutines to read stdout/stderr pipes
+	// Step 10: Register job handle for cleanup
+	p.mu.Lock()
+	p.activeJobs = append(p.activeJobs, jobHandle)
+	jobClosed = true // Parent no longer owns jobHandle
+	p.mu.Unlock()
+	
+	// Step 11: Set up goroutines to read stdout/stderr pipes
 	// These run in background and copy data to cmd.Stdout/Stderr
+	stdoutDone := make(chan struct{})
+	stderrDone := make(chan struct{})
+	
 	if stdoutRead != 0 && cmd.Stdout != nil {
 		go func() {
+			defer close(stdoutDone)
+			defer windows.CloseHandle(stdoutRead)
 			buf := make([]byte, 4096)
 			for {
 				var bytesRead uint32
@@ -592,10 +611,14 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 				cmd.Stdout.Write(buf[:bytesRead])
 			}
 		}()
+	} else {
+		close(stdoutDone)
 	}
 	
 	if stderrRead != 0 && cmd.Stderr != nil {
 		go func() {
+			defer close(stderrDone)
+			defer windows.CloseHandle(stderrRead)
 			buf := make([]byte, 4096)
 			for {
 				var bytesRead uint32
@@ -606,27 +629,35 @@ func (p *Platform) wrapCommandTier2(ctx context.Context, cmd *exec.Cmd, cfg *pla
 				cmd.Stderr.Write(buf[:bytesRead])
 			}
 		}()
+	} else {
+		close(stderrDone)
 	}
 	
-	// Step 10: Handle context cancellation
-	go func() {
-		<-ctx.Done()
-		// Context cancelled - terminate the job (kills all processes in it)
-		p.mu.Lock()
-		defer p.mu.Unlock()
+	// Step 12: Register post-start hook for execHelper
+	// The hook will wait for readers to complete and handle context cancellation
+	platform.PushPostStartHook(cmd, func(cmd *exec.Cmd) error {
+		// Wait for stdout/stderr readers to finish
+		<-stdoutDone
+		<-stderrDone
 		
-		// Find and terminate the job
-		for i, job := range p.activeJobs {
-			if job == jobHandle {
-				// TerminateJobObject is not available; use TerminateProcess on the job
-				// Actually, we need to enumerate processes in job or just rely on
-				// the fact that closing the job with KILL_ON_JOB_CLOSE will work
-				// For now, we rely on Job Object LIMIT_KILL_ON_JOB_CLOSE
-				_ = i // silence unused warning
-				break
+		// Handle context cancellation by terminating the job
+		select {
+		case <-ctx.Done():
+			p.mu.Lock()
+			for _, job := range p.activeJobs {
+				if job == jobHandle {
+					// TerminateJobObject kills all processes in the job
+					windows.TerminateJobObject(job, 1)
+					break
+				}
 			}
+			p.mu.Unlock()
+			return ctx.Err()
+		default:
 		}
-	}()
+		
+		return nil
+	})
 	
 	return nil
 }

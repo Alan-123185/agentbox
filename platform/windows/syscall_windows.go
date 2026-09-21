@@ -380,6 +380,29 @@ func localFree(hMem uintptr) uintptr {
 	return r1
 }
 
+// createEnvironmentBlock creates a Windows environment block from Go string slice.
+// The environment block is a null-terminated string in the format:
+//   VAR1=value1\0VAR2=value2\0...\0\0
+//
+// Parameters:
+//   - env: Slice of environment variables in "KEY=value" format
+//
+// Returns the environment block as a UTF-16 encoded string, or an error if conversion fails.
+func createEnvironmentBlock(env []string) (string, error) {
+	if len(env) == 0 {
+		return "", nil
+	}
+	
+	// Build environment block: VAR1=val1\0VAR2=val2\0...\0\0
+	var block string
+	for _, e := range env {
+		block += e + "\x00"
+	}
+	block += "\x00" // Double null terminator
+	
+	return block, nil
+}
+
 // createProcessWithLogonW creates a new process and logs on a specified user.
 // It wraps the CreateProcessWithLogonW Windows API from advapi32.dll.
 //
