@@ -1,64 +1,46 @@
-# Compiled binary (only the root-level CLI binary, not cmd/agentbox/ source dir)
-/agentbox
-
-# Test binary
-*.test
-
-# Example binaries
-/agentsim
-/approval
-/benchmark
-/classifier
-/codemod
-/codereview
-/darwin
-/devworkflow
-/envutil
-/filesystem
-/gitops
-/healthcheck
-/manager
-/minimal
-/multicommand
-/network
-/networkaccess
-/pathutil
-/projectinit
-/projectscaffold
-/researchflow
-/ruleanalysis
-/sandbox-bench
-/security
-/timeout
-/trustlevel9
-/wrap
-
-# Windows executables
+```
+# Go-specific ignores
+*.o
+*.a
+*.so
+*.dylib
+*.dll
 *.exe
-
-# Coverage output
 *.out
-coverage.html
+*.test
+*.prof
+*.mod
+*.sum
 
-# IDE
-.idea/
+# Dependencies
+vendor/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Editors
 .vscode/
+.idea/
 *.swp
 *.swo
 
-# OS
-.DS_Store
-Thumbs.db
+# Environment
+.env
+.env.local
+*.env.*
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
 
 # Build artifacts
-/bin/
-/dist/
-
-# Benchmark reports (generated on test servers)
-/benchmarks/
-
-# Misc
-/EOF
-all_commands_merged.json
-all_execute_commands.json
-execute_commands_all_raw.json
+bin/
+_dist/
+dist/
+_build/
+build/
+target/
+```

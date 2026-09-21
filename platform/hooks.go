@@ -14,24 +14,30 @@ import (
 // the process begins execution (e.g., Job Object assignment to a suspended process).
 type PostStartHook func(cmd *exec.Cmd) error
 
-var (
-	postStartMu    sync.Mutex
-	postStartHooks = map[*exec.Cmd]PostStartHook{}
-)
-
-// RegisterPostStartHook registers a hook to be called after cmd.Start().
+// PushPostStartHook registers a hook to be called after cmd.Start().
 // The platform's WrapCommand implementation can use this to set up Job Objects,
 // assign security contexts, or perform other post-creation operations.
 //
 // The hook is automatically removed after execution by PopPostStartHook.
 // If cmd is nil, this is a no-op.
-func RegisterPostStartHook(cmd *exec.Cmd, hook PostStartHook) {
+func PushPostStartHook(cmd *exec.Cmd, hook PostStartHook) {
 	if cmd == nil || hook == nil {
 		return
 	}
 	postStartMu.Lock()
 	defer postStartMu.Unlock()
 	postStartHooks[cmd] = hook
+}
+
+var (
+	postStartMu    sync.Mutex
+	postStartHooks = map[*exec.Cmd]PostStartHook{}
+)
+
+// RegisterPostStartHook registers a hook to be called after cmd.Start().
+// Deprecated: Use PushPostStartHook instead. This alias exists for backwards compatibility.
+func RegisterPostStartHook(cmd *exec.Cmd, hook PostStartHook) {
+	PushPostStartHook(cmd, hook)
 }
 
 // PopPostStartHook retrieves and removes the registered hook for cmd.
